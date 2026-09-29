@@ -40,6 +40,31 @@ let
 
   gib = n: n * 1024 * 1024 * 1024;
 
+  localStore = dir: keySize: blockSize: newBlocks: {
+    local = {
+      keyLocationMapOnBlockDevice.file = {
+        path = "${dir}/key_location_map";
+        sizeBytes = keySize;
+      };
+      keyLocationMapMaximumGetAttempts = 16;
+      keyLocationMapMaximumPutAttempts = 64;
+      oldBlocks = 8;
+      currentBlocks = 24;
+      inherit newBlocks;
+      blocksOnBlockDevice = {
+        source.file = {
+          path = "${dir}/blocks";
+          sizeBytes = blockSize;
+        };
+        spareBlocks = 3;
+      };
+      persistent = {
+        stateDirectoryPath = "${dir}/persistent_state";
+        minimumEpochInterval = "300s";
+      };
+    };
+  };
+
   serviceConfig = {
     User = "buildbarn";
     Group = "buildbarn";
@@ -107,31 +132,6 @@ let
       localStorage = "127.0.0.1:${toString ports.storage}";
       inherit (cfg.server) storageDir;
 
-      localStore = dir: keySize: blockSize: newBlocks: {
-        local = {
-          keyLocationMapOnBlockDevice.file = {
-            path = "${storageDir}/${dir}/key_location_map";
-            sizeBytes = keySize;
-          };
-          keyLocationMapMaximumGetAttempts = 16;
-          keyLocationMapMaximumPutAttempts = 64;
-          oldBlocks = 8;
-          currentBlocks = 24;
-          inherit newBlocks;
-          blocksOnBlockDevice = {
-            source.file = {
-              path = "${storageDir}/${dir}/blocks";
-              sizeBytes = blockSize;
-            };
-            spareBlocks = 3;
-          };
-          persistent = {
-            stateDirectoryPath = "${storageDir}/${dir}/persistent_state";
-            minimumEpochInterval = "300s";
-          };
-        };
-      };
-
       storageConfig = mkConfig "storage" {
         grpcServers = [
           {
@@ -141,13 +141,13 @@ let
         ];
         inherit maximumMessageSizeBytes;
         contentAddressableStorage = {
-          backend = localStore "storage-cas" (gib 1) (gib cfg.server.casSize) 3;
+          backend = localStore "${storageDir}/storage-cas" (gib 1) (gib cfg.server.casSize) 3;
           getAuthorizer = allow;
           putAuthorizer = allow;
           findMissingAuthorizer = allow;
         };
         actionCache = {
-          backend = localStore "storage-ac" (64 * 1024 * 1024) (gib cfg.server.actionCacheSize) 1;
+          backend = localStore "${storageDir}/storage-ac" (64 * 1024 * 1024) (gib cfg.server.actionCacheSize) 1;
           getAuthorizer = allow;
           putAuthorizer = allow;
         };
@@ -260,7 +260,20 @@ let
     let
       bb = cfg.remoteExecutionPackage;
       inherit (cfg.worker) workDir;
-      blobstore = blobstoreFor "${cfg.worker.server}:${toString ports.storage}";
+      remoteStorage = "${cfg.worker.server}:${toString ports.storage}";
+      casCacheDir = "${workDir}/cas";
+      casCacheEnabled = cfg.worker.casCacheSize != null;
+      blobstore =
+        blobstoreFor remoteStorage
+        // lib.optionalAttrs casCacheEnabled {
+          contentAddressableStorage.readCaching = {
+            slow = grpcClient remoteStorage;
+            fast =
+              localStore casCacheDir (cfg.worker.casCacheSize * 8 * 1024 * 1024) (gib cfg.worker.casCacheSize)
+                3;
+            replicator.local = { };
+          };
+        };
 
       runnerEnv = pkgs.buildFHSEnv {
         name = "buildbarn-runner-env";
@@ -364,10 +377,16 @@ let
             "buildbarn-scheduler.service"
           ];
           wants = [ "network-online.target" ];
-          serviceConfig = serviceConfig // {
-            ExecStart = "${bb}/bin/bb_worker ${workerConfig}";
-            RestartSec = 5;
-          };
+          serviceConfig =
+            serviceConfig
+            // {
+              ExecStart = "${bb}/bin/bb_worker ${workerConfig}";
+              RestartSec = 5;
+            }
+            // lib.optionalAttrs casCacheEnabled {
+              ExecStartPre = "${getExe' pkgs.coreutils "mkdir"} -p ${casCacheDir}/persistent_state";
+              UMask = "0027";
+            };
         };
       };
     };
@@ -505,6 +524,13 @@ in
           }
         '';
         description = "Additional runners with their own pool, slots and memory limit, sharing the worker's build directory and cache. Each one becomes a buildbarn-runner-<name> unit.";
+      };
+
+      casCacheSize = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 50;
+        description = "Size in GiB of a local copy of the server's CAS under workDir/cas, kept across restarts. bb_worker empties its file cache on every start, and with this set it refills that cache from local disk instead of the server. Writes still go straight to the server. null disables it.";
       };
 
       cacheSize = mkOption {

@@ -67,6 +67,10 @@ A machine can run both roles. The packages are built with your nixpkgs through
   VPN. `server.openFirewall` opens 8980, 8981 and 8983 on every interface.
 - The CAS and action cache are sparse block files under `server.storageDir`,
   150 GiB and 1 GiB by default. Put them on a filesystem you don't back up.
+- bb_worker empties its file cache every time it starts, so a restarted worker
+  downloads the toolchain and common headers from the server again. On workers
+  far from the server, set `worker.casCacheSize` to keep a local copy of the
+  CAS that survives restarts.
 - The runner executes actions inside an FHS environment built from
   `worker.runnerPackages`, at nice 19 and with `MemoryMax=16G` by default.
   Remote clients upload the toolchain as inputs, so the worker needs no

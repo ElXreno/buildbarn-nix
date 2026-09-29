@@ -20,6 +20,7 @@ self: {
           concurrency = 2;
           memoryMax = "1G";
           cacheSize = 1;
+          casCacheSize = 1;
           extraRunners.java = {
             pool = "java16";
             concurrency = 1;
@@ -48,6 +49,12 @@ self: {
       machine.wait_for_open_port(8980)
       machine.wait_until_succeeds(workers("default") + " | grep -qx 2")
       machine.wait_until_succeeds(workers("java16") + " | grep -qx 1")
+
+      machine.succeed("test -f /var/lib/buildbarn/worker/cas/blocks")
+      machine.succeed("test -f /var/lib/buildbarn/worker/cas/key_location_map")
+      machine.succeed("test -d /var/lib/buildbarn/worker/cas/persistent_state")
+      machine.succeed("systemctl restart buildbarn-worker.service")
+      machine.wait_until_succeeds(workers("default") + " | grep -qx 2")
 
       import time
       start = time.monotonic()
