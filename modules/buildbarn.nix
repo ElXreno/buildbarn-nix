@@ -355,7 +355,14 @@ let
       // {
         buildbarn-worker = {
           wantedBy = [ "multi-user.target" ];
-          after = [ "network-online.target" ] ++ map (runner: "${runner.unit}.service") runners;
+          after = [
+            "network-online.target"
+          ]
+          ++ map (runner: "${runner.unit}.service") runners
+          ++ lib.optionals cfg.server.enable [
+            "buildbarn-storage.service"
+            "buildbarn-scheduler.service"
+          ];
           wants = [ "network-online.target" ];
           serviceConfig = serviceConfig // {
             ExecStart = "${bb}/bin/bb_worker ${workerConfig}";

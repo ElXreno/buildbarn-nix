@@ -48,5 +48,11 @@ self: {
       machine.wait_for_open_port(8980)
       machine.wait_until_succeeds(workers("default") + " | grep -qx 2")
       machine.wait_until_succeeds(workers("java16") + " | grep -qx 1")
+
+      import time
+      start = time.monotonic()
+      machine.succeed("systemctl stop buildbarn-worker.service buildbarn-scheduler.service buildbarn-storage.service")
+      elapsed = time.monotonic() - start
+      assert elapsed < 30, f"stopping the worker together with the server took {elapsed:.0f}s"
     '';
 }
