@@ -256,8 +256,7 @@ let
             ];
           }
         ];
-        inputDownloadConcurrency = 16;
-        outputUploadConcurrency = 16;
+        inherit (cfg.worker) inputDownloadConcurrency outputUploadConcurrency;
         directoryCache = {
           maximumCount = 100000;
           maximumSizeBytes = 256 * 1024 * 1024;
@@ -392,6 +391,18 @@ in
         type = types.ints.positive;
         default = 40;
         description = "Local input file cache size in GiB.";
+      };
+
+      inputDownloadConcurrency = mkOption {
+        type = types.ints.positive;
+        default = 64;
+        description = "Number of input files the worker downloads from the storage at once, shared by all actions. Raise it when the server is far away, since each download waits a full round trip.";
+      };
+
+      outputUploadConcurrency = mkOption {
+        type = types.ints.positive;
+        default = 64;
+        description = "Number of output files the worker uploads to the storage at once, shared by all actions.";
       };
 
       runnerPackages = mkOption {
