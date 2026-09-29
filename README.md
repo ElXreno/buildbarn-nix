@@ -86,5 +86,39 @@ export NINJA_REMOTE_NUM_JOBS=64
 ```
 
 Keep `NINJA_REMOTE_NUM_JOBS` well above the total number of worker slots. Under
-RBE it becomes ninja's `-j`, and local-only jobs such as Java and Rust count
-against it too.
+RBE it becomes ninja's `-j`, and local-only jobs such as Kotlin and aapt2 count
+against it too. The `-j` you pass to `m` only sizes the pool of local jobs.
+
+Rust and C++ links can go remote as well, with
+`RBE_RUST=1 RBE_RUST_EXEC_STRATEGY=remote_local_fallback` and
+`RBE_CXX_LINKS=1 RBE_CXX_LINKS_EXEC_STRATEGY=remote_local_fallback`.
+
+## Pools
+
+The scheduler keeps a queue per platform, and Soong's reclient rules tag every
+action with a `Pool` property: `default` for C++, links and Rust, `java16` for
+javac, turbine, R8, D8 and metalava. The main runner serves `default`. Java
+actions take 4 GiB of heap each and more with metalava, so they get a runner
+of their own with few slots and a memory limit that fits them:
+
+```nix
+services.buildbarn.worker.extraRunners.java = {
+  pool = "java16";
+  concurrency = 2;
+  memoryMax = "12G";
+};
+```
+
+and on the client:
+
+```sh
+export RBE_JAVAC=1 RBE_JAVAC_EXEC_STRATEGY=remote_local_fallback
+export RBE_TURBINE=1 RBE_TURBINE_EXEC_STRATEGY=remote_local_fallback
+export RBE_R8=1 RBE_R8_EXEC_STRATEGY=remote_local_fallback
+export RBE_D8=1 RBE_D8_EXEC_STRATEGY=remote_local_fallback
+export RBE_METALAVA=1 RBE_METALAVA_EXEC_STRATEGY=remote_local_fallback
+```
+
+Make sure at least one worker serves every pool the client uses. Actions for a
+pool without workers wait 15 minutes before they fail and reclient falls back
+to running them locally.

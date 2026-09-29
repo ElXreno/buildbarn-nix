@@ -54,6 +54,52 @@ let
       inherit default description;
     };
 
+  runnerModule =
+    { config, ... }:
+    {
+      options = {
+        pool = mkOption {
+          type = types.str;
+          example = "java16";
+          description = "Pool platform property this runner serves. Soong's reclient rules send java16 for javac, turbine, R8, D8 and metalava.";
+        };
+
+        platform = mkOption {
+          type = types.attrsOf types.str;
+          default = {
+            Pool = config.pool;
+            "container-image" = cfg.containerImage;
+          };
+          defaultText = literalExpression ''
+            {
+              Pool = pool;
+              "container-image" = config.services.buildbarn.containerImage;
+            }
+          '';
+          description = "Platform properties this runner advertises.";
+        };
+
+        concurrency = mkOption {
+          type = types.ints.positive;
+          default = 2;
+          description = "Number of actions this runner executes in parallel.";
+        };
+
+        memoryMax = mkOption {
+          type = types.str;
+          default = "16G";
+          description = "systemd MemoryMax of this runner.";
+        };
+
+        nice = mkOption {
+          type = types.ints.between (-20) 19;
+          default = cfg.worker.nice;
+          defaultText = literalExpression "config.services.buildbarn.worker.nice";
+          description = "Nice value of this runner.";
+        };
+      };
+    };
+
   server =
     let
       bbStorage = getExe cfg.storagePackage;
@@ -134,7 +180,7 @@ let
         killOperationsAuthorizer = allow;
         synchronizeAuthorizer = allow;
         actionRouter.simple = {
-          platformKeyExtractor.static.properties = [ ];
+          platformKeyExtractor.action = { };
           invocationKeyExtractors = [
             { correlatedInvocationsId = { }; }
             { toolInvocationId = { }; }
@@ -214,7 +260,6 @@ let
     let
       bb = cfg.remoteExecutionPackage;
       inherit (cfg.worker) workDir;
-      runnerSocket = "${workDir}/runner";
       blobstore = blobstoreFor "${cfg.worker.server}:${toString ports.storage}";
 
       runnerEnv = pkgs.buildFHSEnv {
@@ -223,14 +268,53 @@ let
         runScript = "${bb}/bin/bb_runner";
       };
 
-      runnerConfig = mkConfig "runner" {
-        buildDirectoryPath = "${workDir}/build";
-        grpcServers = [
-          {
-            listenPaths = [ runnerSocket ];
-            authenticationPolicy = allow;
-          }
-        ];
+      runners = [
+        {
+          unit = "buildbarn-runner";
+          socket = "${workDir}/runner";
+          workerId = { };
+          inherit (cfg.worker)
+            concurrency
+            memoryMax
+            nice
+            platform
+            ;
+        }
+      ]
+      ++ lib.mapAttrsToList (name: runner: {
+        unit = "buildbarn-runner-${name}";
+        socket = "${workDir}/runner-${name}";
+        workerId.runner = name;
+        inherit (runner)
+          concurrency
+          memoryMax
+          nice
+          platform
+          ;
+      }) cfg.worker.extraRunners;
+
+      runnerService = runner: {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = serviceConfig // {
+          ExecStartPre = [
+            "${getExe' pkgs.coreutils "mkdir"} -p ${workDir}/build ${workDir}/cache"
+            "${getExe' pkgs.coreutils "rm"} -f ${runner.socket}"
+          ];
+          ExecStart = "${getExe runnerEnv} ${
+            mkConfig runner.unit {
+              buildDirectoryPath = "${workDir}/build";
+              grpcServers = [
+                {
+                  listenPaths = [ runner.socket ];
+                  authenticationPolicy = allow;
+                }
+              ];
+            }
+          }";
+          ExecStartPost = "${getExe pkgs.bash} -c 'until [ -S ${runner.socket} ]; do sleep 0.1; done'";
+          MemoryMax = runner.memoryMax;
+          Nice = runner.nice;
+        };
       };
 
       workerConfig = mkConfig "worker" {
@@ -246,14 +330,14 @@ let
               maximumCacheSizeBytes = gib cfg.worker.cacheSize;
               cacheReplacementPolicy = "LEAST_RECENTLY_USED";
             };
-            runners = [
-              {
-                endpoint.address = "unix://${runnerSocket}";
-                inherit (cfg.worker) concurrency;
-                platform = { };
-                workerId.hostname = config.networking.hostName;
-              }
-            ];
+            runners = map (runner: {
+              endpoint.address = "unix://${runner.socket}";
+              inherit (runner) concurrency;
+              platform.properties = lib.mapAttrsToList (name: value: { inherit name value; }) runner.platform;
+              workerId = runner.workerId // {
+                hostname = config.networking.hostName;
+              };
+            }) runners;
           }
         ];
         inherit (cfg.worker) inputDownloadConcurrency outputUploadConcurrency;
@@ -265,26 +349,13 @@ let
       };
     in
     {
-      systemd.services = {
-        buildbarn-runner = {
-          wantedBy = [ "multi-user.target" ];
-          serviceConfig = serviceConfig // {
-            ExecStartPre = [
-              "${getExe' pkgs.coreutils "mkdir"} -p ${workDir}/build ${workDir}/cache"
-              "${getExe' pkgs.coreutils "rm"} -f ${runnerSocket}"
-            ];
-            ExecStart = "${getExe runnerEnv} ${runnerConfig}";
-            ExecStartPost = "${getExe pkgs.bash} -c 'until [ -S ${runnerSocket} ]; do sleep 0.1; done'";
-            MemoryMax = cfg.worker.memoryMax;
-            Nice = cfg.worker.nice;
-          };
-        };
+      systemd.services = lib.listToAttrs (
+        map (runner: lib.nameValuePair runner.unit (runnerService runner)) runners
+      )
+      // {
         buildbarn-worker = {
           wantedBy = [ "multi-user.target" ];
-          after = [
-            "network-online.target"
-            "buildbarn-runner.service"
-          ];
+          after = [ "network-online.target" ] ++ map (runner: "${runner.unit}.service") runners;
           wants = [ "network-online.target" ];
           serviceConfig = serviceConfig // {
             ExecStart = "${bb}/bin/bb_worker ${workerConfig}";
@@ -314,6 +385,12 @@ in
       type = types.path;
       default = "/var/lib/buildbarn";
       description = "Home of the buildbarn user and the default location of the storage and the worker directories.";
+    };
+
+    containerImage = mkOption {
+      type = types.str;
+      default = "docker://gcr.io/androidbuild-re-dockerimage/android-build-remoteexec-image@sha256:1eb7f64b9e17102b970bd7a1af7daaebdb01c3fb777715899ef462d6c6d01a45";
+      description = "container-image platform property that runners advertise by default. The default is the image AOSP's Soong puts into every reclient action (remoteexec.DefaultImage). Workers never pull it, the value only has to match what clients send.";
     };
 
     ports = {
@@ -385,6 +462,42 @@ in
         type = types.ints.between (-20) 19;
         default = 19;
         description = "Nice value of the runner and everything it executes.";
+      };
+
+      pool = mkOption {
+        type = types.str;
+        default = "default";
+        description = "Pool platform property of the main runner. Soong's reclient rules send default for C++, links and Rust.";
+      };
+
+      platform = mkOption {
+        type = types.attrsOf types.str;
+        default = {
+          Pool = cfg.worker.pool;
+          "container-image" = cfg.containerImage;
+        };
+        defaultText = literalExpression ''
+          {
+            Pool = config.services.buildbarn.worker.pool;
+            "container-image" = config.services.buildbarn.containerImage;
+          }
+        '';
+        description = "Platform properties of the main runner. The scheduler only hands it actions whose platform matches exactly.";
+      };
+
+      extraRunners = mkOption {
+        type = types.attrsOf (types.submodule runnerModule);
+        default = { };
+        example = literalExpression ''
+          {
+            java = {
+              pool = "java16";
+              concurrency = 2;
+              memoryMax = "12G";
+            };
+          }
+        '';
+        description = "Additional runners with their own pool, slots and memory limit, sharing the worker's build directory and cache. Each one becomes a buildbarn-runner-<name> unit.";
       };
 
       cacheSize = mkOption {

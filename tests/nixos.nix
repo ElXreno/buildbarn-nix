@@ -20,17 +20,33 @@ self: {
           concurrency = 2;
           memoryMax = "1G";
           cacheSize = 1;
+          extraRunners.java = {
+            pool = "java16";
+            concurrency = 1;
+            memoryMax = "512M";
+          };
         };
       };
     };
 
-  testScript = ''
-    machine.wait_for_unit("buildbarn-frontend.service")
-    machine.wait_for_unit("buildbarn-worker.service")
-    machine.wait_for_open_port(8980)
-    machine.wait_until_succeeds(
-      "curl -sf 'http://127.0.0.1:7982/workers?filter=%7b%22all%22%3a%7b%22platformQueueName%22%3a%7b%22platform%22%3a%7b%7d%7d%7d%7d'"
-      " | grep -o 'hostname=&#34;machine&#34;' | wc -l | grep -qx 2"
-    )
-  '';
+  testScript =
+    { nodes, ... }:
+    ''
+      import json
+      import urllib.parse
+
+      image = "${nodes.machine.services.buildbarn.containerImage}"
+
+      def workers(pool):
+          platform = {"properties": [{"name": "Pool", "value": pool}, {"name": "container-image", "value": image}]}
+          query = urllib.parse.quote(json.dumps({"all": {"platformQueueName": {"platform": platform}}}, separators=(",", ":")))
+          return f"curl -sf 'http://127.0.0.1:7982/workers?filter={query}' | grep -o 'hostname=&#34;machine&#34;' | wc -l"
+
+      machine.wait_for_unit("buildbarn-frontend.service")
+      machine.wait_for_unit("buildbarn-worker.service")
+      machine.wait_for_unit("buildbarn-runner-java.service")
+      machine.wait_for_open_port(8980)
+      machine.wait_until_succeeds(workers("default") + " | grep -qx 2")
+      machine.wait_until_succeeds(workers("java16") + " | grep -qx 1")
+    '';
 }
